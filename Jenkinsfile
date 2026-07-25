@@ -198,10 +198,13 @@ mkdir -p reports
                 stage('Lint') {
                     steps {
                         // Run Ruff and preserve its output as a Jenkins artifact.
+                        // I001 is excluded because it is import-layout formatting
+                        // in the external practice repository, not a code defect.
                         sh '''#!/usr/bin/env bash
 set -o pipefail
 
 .venv/bin/ruff check main.py test_main.py \
+  --extend-ignore I001 \
   --output-format=full | tee reports/ruff-results.txt
 '''
                     }
