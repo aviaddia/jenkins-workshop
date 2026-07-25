@@ -1,45 +1,60 @@
 pipeline {
+    // Do not reserve one Jenkins agent for the entire pipeline.
+    // Each group of stages selects the agent that has the tools it needs.
     agent none
 
     options {
+        // The pipeline performs an explicit checkout on exec_node_1.
         skipDefaultCheckout(true)
+        // Add a timestamp to every console-log line.
         timestamps()
+        // Prevent two builds from using the same Docker resources concurrently.
         disableConcurrentBuilds()
+        // Keep the most recent 30 builds and discard older build history.
         buildDiscarder(logRotator(numToKeepStr: '30'))
+        // Stop a hung build after 45 minutes.
         timeout(time: 45, unit: 'MINUTES')
     }
 
     parameters {
+        // The Jenkinsfile is stored in aviaddia/jenkins-workshop on master,
+        // while this parameter selects the application source repository.
         string(
             name: 'REPO_URL',
-            defaultValue: '',
-            description: 'Optional repository override; leave empty to build the repository containing this Jenkinsfile'
+            defaultValue: 'https://github.com/codeby-Vishwajeet/python-fastapi-boilerplate.git',
+            description: 'Python application repository to build'
         )
 
+        // This is the application repository branch, not the branch from
+        // which Jenkins loads this Jenkinsfile.
         string(
             name: 'GIT_BRANCH',
             defaultValue: 'main',
-            description: 'Git branch to build'
+            description: 'Application repository branch to build'
         )
 
+        // This key identifies the project in SonarQube.
         string(
             name: 'SONAR_PROJECT_KEY',
             defaultValue: 'python-fastapi-boilerplate',
             description: 'SonarQube project key'
         )
 
+        // Let workshop users choose whether image findings block the build.
         booleanParam(
             name: 'FAIL_ON_IMAGE_VULNERABILITIES',
             defaultValue: true,
             description: 'Fail when Trivy finds a fixed HIGH or CRITICAL vulnerability'
         )
 
+        // Use either "repository" or "dockerhub-user/repository".
         string(
             name: 'DOCKERHUB_REPOSITORY',
             defaultValue: 'python-fastapi-boilerplate',
             description: 'Docker Hub repository name or namespace/name'
         )
 
+        // Email is optional so the pipeline can run before SMTP is configured.
         string(
             name: 'EMAIL_TO',
             defaultValue: '',
@@ -48,10 +63,14 @@ pipeline {
     }
 
     environment {
+        // Name the temporary image with the unique Jenkins build number.
         LOCAL_IMAGE_NAME = "python-fastapi-boilerplate:${BUILD_NUMBER}"
+        // Give the smoke-test container a name unique to this build.
         SMOKE_CONTAINER = "fastapi-ci-${BUILD_TAG}"
+        // Keep Python CI output clean and predictable.
         PIP_DISABLE_PIP_VERSION_CHECK = '1'
         PYTHONDONTWRITEBYTECODE = '1'
+        // Jenkins username/password credential containing Docker Hub credentials.
         DOCKERHUB_CREDENTIALS_ID = 'dockerhub-credentials'
     }
 
@@ -60,6 +79,7 @@ pipeline {
             agent none
 
             steps {
+                // Reject invalid user input before allocating an execution node.
                 script {
                     if (!params.GIT_BRANCH?.trim()) {
                         error('GIT_BRANCH must not be empty')
@@ -99,24 +119,35 @@ pipeline {
             stages {
                 stage('Checkout') {
                     steps {
+                        // Remove files left in the workspace by an earlier build.
                         deleteDir()
 
+                        // Clone the application repository. The fallback
+                        // values also protect the first run after upgrading
+                        // a job whose older parameters were empty/master.
                         script {
-                            if (params.REPO_URL?.trim()) {
-                                git(
-                                    url: params.REPO_URL.trim(),
-                                    branch: params.GIT_BRANCH.trim()
-                                )
-                            } else {
-                                checkout scm
-                            }
+                            def applicationRepository =
+                                params.REPO_URL?.trim() ?:
+                                'https://github.com/codeby-Vishwajeet/python-fastapi-boilerplate.git'
 
+                            def applicationBranch =
+                                params.REPO_URL?.trim() ?
+                                params.GIT_BRANCH.trim() :
+                                'main'
+
+                            git(
+                                url: applicationRepository,
+                                branch: applicationBranch
+                            )
+
+                            env.BUILT_BRANCH = applicationBranch
                             env.BUILT_REPOSITORY = sh(
                                 script: 'git config --get remote.origin.url',
                                 returnStdout: true
                             ).trim()
                         }
 
+                        // Print the exact commit in the Jenkins console log.
                         sh '''
                             git --no-pager log -1 \
                               --pretty=format:'Commit: %H%nAuthor: %an%nMessage: %s%n'
@@ -136,6 +167,7 @@ pipeline {
 
                 stage('Install Dependencies') {
                     steps {
+                        // Build an isolated Python environment and save its package inventory.
                         sh '''#!/usr/bin/env bash
 set -euo pipefail
 
@@ -153,6 +185,7 @@ mkdir -p reports
 
                 stage('Python Syntax Check') {
                     steps {
+                        // Compile Python files to catch syntax errors without running them.
                         sh '''
                             .venv/bin/python -m compileall \
                               -q \
@@ -164,6 +197,7 @@ mkdir -p reports
 
                 stage('Lint') {
                     steps {
+                        // Run Ruff and preserve its output as a Jenkins artifact.
                         sh '''#!/usr/bin/env bash
 set -o pipefail
 
@@ -175,6 +209,7 @@ set -o pipefail
 
                 stage('Unit Tests and Coverage') {
                     steps {
+                        // Run pytest, publish JUnit results, and create coverage data for SonarQube.
                         sh '''
                             .venv/bin/pytest \
                               --verbose \
@@ -188,6 +223,7 @@ set -o pipefail
 
                     post {
                         always {
+                            // Publish test results even when a test fails.
                             junit(
                                 testResults: 'reports/pytest-results.xml',
                                 allowEmptyResults: true
@@ -198,6 +234,7 @@ set -o pipefail
 
                 stage('SonarQube Analysis') {
                     steps {
+                        // Use the scanner and SonarQube server configured in Jenkins.
                         script {
                             def scannerHome = tool 'SonarScanner'
 
@@ -222,6 +259,7 @@ set -o pipefail
 
             post {
                 always {
+                    // Preserve all source-analysis reports for later review.
                     archiveArtifacts(
                         artifacts: 'reports/**',
                         allowEmptyArchive: true,
@@ -235,6 +273,7 @@ set -o pipefail
             agent none
 
             steps {
+                // Wait for SonarQube's webhook result and fail on a rejected gate.
                 timeout(time: 10, unit: 'MINUTES') {
                     waitForQualityGate abortPipeline: true
                 }
@@ -254,6 +293,7 @@ set -o pipefail
             stages {
                 stage('Prepare Docker Workspace') {
                     steps {
+                        // Start clean and restore the source produced on exec_node_1.
                         deleteDir()
                         unstash 'application-source'
                         sh 'mkdir -p reports'
@@ -262,6 +302,7 @@ set -o pipefail
 
                 stage('Lint Dockerfile') {
                     steps {
+                        // Run Hadolint in a container; no agent-side installation is needed.
                         sh '''#!/usr/bin/env bash
 set -o pipefail
 
@@ -275,6 +316,7 @@ docker run --rm -i \
 
                 stage('Build Docker Image') {
                     steps {
+                        // Build the application image and record its resolved metadata.
                         sh '''
                             docker build \
                               --pull \
@@ -291,6 +333,7 @@ docker run --rm -i \
 
                 stage('Scan Docker Image') {
                     steps {
+                        // Run Trivy against OS and language packages in the built image.
                         script {
                             int scanStatus = sh(
                                 label: 'Trivy package vulnerability scan',
@@ -330,6 +373,7 @@ docker run --rm \
 
                 stage('Container Smoke Test') {
                     steps {
+                        // Start the image and verify that its HTTP endpoint responds successfully.
                         sh '''#!/usr/bin/env bash
 set -euo pipefail
 
@@ -361,6 +405,7 @@ exit 1
 
                 stage('Push to Docker Hub') {
                     steps {
+                        // Log in with a Jenkins credential, tag the image, and push it.
                         script {
                             withCredentials([
                                 usernamePassword(
@@ -409,6 +454,7 @@ printf '%s\n' "$PUBLISHED_IMAGE" > reports/pushed-image.txt
 
             post {
                 always {
+                    // Collect logs and remove containers/images even after a failed stage.
                     sh '''
                         docker logs "$SMOKE_CONTAINER" \
                           > reports/container.log 2>&1 || true
@@ -425,6 +471,7 @@ printf '%s\n' "$PUBLISHED_IMAGE" > reports/pushed-image.txt
                         fi
                     '''
 
+                    // Preserve Docker lint, image scan, metadata, and smoke-test output.
                     archiveArtifacts(
                         artifacts: 'reports/**',
                         allowEmptyArchive: true,
@@ -437,14 +484,17 @@ printf '%s\n' "$PUBLISHED_IMAGE" > reports/pushed-image.txt
 
     post {
         success {
+            // Record a concise success message in the build log.
             echo "CI completed successfully for ${env.BUILT_REPOSITORY ?: 'the configured SCM'}."
         }
 
         unsuccessful {
+            // Point users to the failed stage and archived diagnostic reports.
             echo "CI did not complete successfully. Review the failed stage and archived reports."
         }
 
         always {
+            // Send a result email only when EMAIL_TO contains an address.
             script {
                 if (params.EMAIL_TO?.trim()) {
                     emailext(
@@ -457,7 +507,7 @@ printf '%s\n' "$PUBLISHED_IMAGE" > reports/pushed-image.txt
                             <p><b>Build:</b> #${env.BUILD_NUMBER}</p>
                             <p><b>Status:</b> ${currentBuild.currentResult}</p>
                             <p><b>Repository:</b> ${env.BUILT_REPOSITORY ?: params.REPO_URL ?: 'Configured SCM'}</p>
-                            <p><b>Branch:</b> ${params.GIT_BRANCH}</p>
+                            <p><b>Branch:</b> ${env.BUILT_BRANCH ?: params.GIT_BRANCH}</p>
                             <p><b>Docker image:</b> ${env.PUBLISHED_IMAGE ?: 'Not published'}</p>
                             <p><a href="${env.BUILD_URL}">Open the Jenkins build</a></p>
                         """,
