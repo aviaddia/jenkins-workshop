@@ -35,6 +35,12 @@ pipeline {
         )
 
         string(
+            name: 'DOCKERHUB_REPOSITORY',
+            defaultValue: 'python-fastapi-boilerplate',
+            description: 'Docker Hub repository name or namespace/name'
+        )
+
+        string(
             name: 'EMAIL_TO',
             defaultValue: '',
             description: 'Optional notification address; leave empty to disable email'
@@ -46,6 +52,7 @@ pipeline {
         SMOKE_CONTAINER = "fastapi-ci-${BUILD_TAG}"
         PIP_DISABLE_PIP_VERSION_CHECK = '1'
         PYTHONDONTWRITEBYTECODE = '1'
+        DOCKERHUB_CREDENTIALS_ID = 'dockerhub-credentials'
     }
 
     stages {
@@ -58,13 +65,21 @@ pipeline {
                         error('GIT_BRANCH must not be empty')
                     }
 
-                    if (!(params.SONAR_PROJECT_KEY ==~ /^[A-Za-z0-9_.:-]+$/)) {
+                    if (!params.SONAR_PROJECT_KEY.matches('[A-Za-z0-9_.:-]+')) {
                         error('SONAR_PROJECT_KEY contains unsupported characters')
                     }
 
+                    if (!params.DOCKERHUB_REPOSITORY.matches(
+                        '[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*'
+                    )) {
+                        error(
+                            'DOCKERHUB_REPOSITORY must be a lowercase repository name ' +
+                            'or namespace/repository'
+                        )
+                    }
+
                     if (params.EMAIL_TO?.trim() &&
-                        !(params.EMAIL_TO.trim() ==~
-                          /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/)) {
+                        !params.EMAIL_TO.trim().matches('[^\\s@]+@[^\\s@]+\\.[^\\s@]+')) {
                         error('EMAIL_TO must be empty or contain one valid email address')
                     }
                 }
@@ -343,6 +358,53 @@ exit 1
 '''
                     }
                 }
+
+                stage('Push to Docker Hub') {
+                    steps {
+                        script {
+                            withCredentials([
+                                usernamePassword(
+                                    credentialsId: env.DOCKERHUB_CREDENTIALS_ID,
+                                    usernameVariable: 'DOCKERHUB_USER',
+                                    passwordVariable: 'DOCKERHUB_TOKEN'
+                                )
+                            ]) {
+                                def targetRepository = params.DOCKERHUB_REPOSITORY.trim()
+
+                                /*
+                                 * If only a repository name was supplied,
+                                 * publish below the authenticated user's
+                                 * Docker Hub namespace.
+                                 */
+                                if (!targetRepository.contains('/')) {
+                                    targetRepository =
+                                        "${env.DOCKERHUB_USER}/${targetRepository}"
+                                }
+
+                                env.PUBLISHED_IMAGE =
+                                    "${targetRepository}:${env.BUILD_NUMBER}"
+
+                                try {
+                                    sh '''#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%s' "$DOCKERHUB_TOKEN" |
+  docker login \
+    --username "$DOCKERHUB_USER" \
+    --password-stdin
+
+docker tag "$LOCAL_IMAGE_NAME" "$PUBLISHED_IMAGE"
+docker push "$PUBLISHED_IMAGE"
+
+printf '%s\n' "$PUBLISHED_IMAGE" > reports/pushed-image.txt
+'''
+                                } finally {
+                                    sh 'docker logout >/dev/null 2>&1 || true'
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             post {
@@ -356,6 +418,11 @@ exit 1
 
                         docker image rm -f "$LOCAL_IMAGE_NAME" \
                           >/dev/null 2>&1 || true
+
+                        if [ -n "${PUBLISHED_IMAGE:-}" ]; then
+                          docker image rm -f "$PUBLISHED_IMAGE" \
+                            >/dev/null 2>&1 || true
+                        fi
                     '''
 
                     archiveArtifacts(
@@ -391,6 +458,7 @@ exit 1
                             <p><b>Status:</b> ${currentBuild.currentResult}</p>
                             <p><b>Repository:</b> ${env.BUILT_REPOSITORY ?: params.REPO_URL ?: 'Configured SCM'}</p>
                             <p><b>Branch:</b> ${params.GIT_BRANCH}</p>
+                            <p><b>Docker image:</b> ${env.PUBLISHED_IMAGE ?: 'Not published'}</p>
                             <p><a href="${env.BUILD_URL}">Open the Jenkins build</a></p>
                         """,
                         attachLog: true,
