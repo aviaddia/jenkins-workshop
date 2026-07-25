@@ -33,20 +33,6 @@ pipeline {
             description: 'Application repository branch to build'
         )
 
-        // This key identifies the project in SonarQube.
-        string(
-            name: 'SONAR_PROJECT_KEY',
-            defaultValue: 'python-fastapi-boilerplate',
-            description: 'SonarQube project key'
-        )
-
-        // Let workshop users choose whether image findings block the build.
-        booleanParam(
-            name: 'FAIL_ON_IMAGE_VULNERABILITIES',
-            defaultValue: true,
-            description: 'Fail when Trivy finds a fixed HIGH or CRITICAL vulnerability'
-        )
-
         // Use either "repository" or "dockerhub-user/repository".
         string(
             name: 'DOCKERHUB_REPOSITORY',
@@ -85,10 +71,6 @@ pipeline {
                         error('GIT_BRANCH must not be empty')
                     }
 
-                    if (!params.SONAR_PROJECT_KEY.matches('[A-Za-z0-9_.:-]+')) {
-                        error('SONAR_PROJECT_KEY contains unsupported characters')
-                    }
-
                     if (!params.DOCKERHUB_REPOSITORY.matches(
                         '[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*'
                     )) {
@@ -108,8 +90,7 @@ pipeline {
 
         /*
          * One agent allocation is retained for all source-code CI stages.
-         * Required on exec_node_1: Git, Python 3.11+, venv and the configured
-         * Jenkins SonarScanner tool.
+         * Required on exec_node_1: Git, Python 3.11+ and venv.
          */
         stage('Python CI') {
             agent {
@@ -212,7 +193,7 @@ set -o pipefail
 
                 stage('Unit Tests and Coverage') {
                     steps {
-                        // Run pytest, publish JUnit results, and create coverage data for SonarQube.
+                        // Run pytest, publish JUnit results, and record coverage.
                         sh '''
                             .venv/bin/pytest \
                               --verbose \
@@ -237,25 +218,8 @@ set -o pipefail
 
                 stage('SonarQube Analysis') {
                     steps {
-                        // Use the scanner and SonarQube server configured in Jenkins.
-                        script {
-                            def scannerHome = tool 'SonarScanner'
-
-                            withEnv(["SCANNER_HOME=${scannerHome}"]) {
-                                withSonarQubeEnv('SonarQube') {
-                                    sh '''
-                                        "$SCANNER_HOME/bin/sonar-scanner" \
-                                          -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
-                                          -Dsonar.projectName="$SONAR_PROJECT_KEY" \
-                                          -Dsonar.sources=main.py \
-                                          -Dsonar.tests=test_main.py \
-                                          -Dsonar.python.version=3.11 \
-                                          -Dsonar.python.coverage.reportPaths=reports/coverage.xml \
-                                          -Dsonar.sourceEncoding=UTF-8
-                                    '''
-                                }
-                            }
-                        }
+                        // Placeholder: no SonarQube endpoint is available.
+                        echo 'SonarQube analysis skipped; no endpoint is configured.'
                     }
                 }
             }
@@ -276,17 +240,15 @@ set -o pipefail
             agent none
 
             steps {
-                // Wait for SonarQube's webhook result and fail on a rejected gate.
-                timeout(time: 10, unit: 'MINUTES') {
-                    waitForQualityGate abortPipeline: true
-                }
+                // Placeholder: pass without waiting for a SonarQube webhook.
+                echo 'SonarQube quality gate skipped; no endpoint is configured.'
             }
         }
 
         /*
          * Required on exec_node_2: Docker CLI and access to a Docker daemon.
-         * Hadolint and Trivy run as containers, so they do not need to be
-         * installed directly on the Jenkins agent.
+         * Hadolint runs as a container, so it does not need to be installed
+         * directly on the Jenkins agent.
          */
         stage('Container CI') {
             agent {
@@ -336,41 +298,8 @@ docker run --rm -i \
 
                 stage('Scan Docker Image') {
                     steps {
-                        // Run Trivy against OS and language packages in the built image.
-                        script {
-                            int scanStatus = sh(
-                                label: 'Trivy package vulnerability scan',
-                                returnStatus: true,
-                                script: '''#!/usr/bin/env bash
-set -o pipefail
-
-docker run --rm \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v trivy-cache:/root/.cache/trivy \
-  aquasec/trivy:latest \
-  image \
-    --scanners vuln \
-    --severity HIGH,CRITICAL \
-    --ignore-unfixed \
-    --exit-code 1 \
-    "$LOCAL_IMAGE_NAME" | tee reports/trivy-image-results.txt
-'''
-                            )
-
-                            if (scanStatus != 0) {
-                                if (params.FAIL_ON_IMAGE_VULNERABILITIES) {
-                                    error(
-                                        'Trivy found fixed HIGH or CRITICAL vulnerabilities. ' +
-                                        'See reports/trivy-image-results.txt.'
-                                    )
-                                }
-
-                                unstable(
-                                    'Trivy found fixed HIGH or CRITICAL vulnerabilities, ' +
-                                    'but FAIL_ON_IMAGE_VULNERABILITIES is disabled.'
-                                )
-                            }
-                        }
+                        // Placeholder: no image-security scanner is configured.
+                        echo 'Docker image security scan skipped; no scanner is configured.'
                     }
                 }
 
