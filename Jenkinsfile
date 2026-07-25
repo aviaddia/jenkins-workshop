@@ -265,6 +265,28 @@ set -o pipefail
                     }
                 }
 
+                stage('Correct Docker Startup Command') {
+                    steps {
+                        // The external practice repository uses "main.py:app",
+                        // but Uvicorn requires the import string "main:app".
+                        // Patch only the temporary CI workspace before building.
+                        sh '''#!/usr/bin/env bash
+set -euo pipefail
+
+if grep -Fq '"main.py:app"' Dockerfile; then
+  sed -i 's/"main\\.py:app"/"main:app"/' Dockerfile
+fi
+
+grep -Fq '"main:app"' Dockerfile || {
+  echo 'ERROR: Dockerfile does not contain the expected Uvicorn main:app command.'
+  exit 1
+}
+
+cp Dockerfile reports/Dockerfile.built
+'''
+                    }
+                }
+
                 stage('Lint Dockerfile') {
                     steps {
                         // Run Hadolint in a container; no agent-side installation is needed.
