@@ -273,6 +273,7 @@ set -o pipefail
 
 docker run --rm -i \
   hadolint/hadolint:v2.12.0-debian \
+  hadolint \
   --failure-threshold error - \
   < Dockerfile | tee reports/hadolint-results.txt
 '''
