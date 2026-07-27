@@ -1,0 +1,508 @@
+pipeline {
+    agent { label 'eks-deployer' }
+
+    options {
+        disableConcurrentBuilds()
+        timestamps()
+        timeout(time: 90, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        skipDefaultCheckout(true)
+    }
+
+    parameters {
+        string(
+            name: 'AWS_REGION',
+            defaultValue: 'eu-north-1',
+            description: 'AWS Region that contains, or will contain, the EKS cluster.'
+        )
+        string(
+            name: 'EKS_CLUSTER_NAME',
+            defaultValue: 'application-eks',
+            description: 'Existing EKS cluster name, or the name to create.'
+        )
+        string(
+            name: 'KUBERNETES_VERSION',
+            defaultValue: '',
+            description: 'Optional Kubernetes version, for example 1.34. Leave blank to use the eksctl default.'
+        )
+        string(
+            name: 'NODE_GROUP_NAME',
+            defaultValue: 'application-nodes',
+            description: 'Managed node group name used only when a new cluster is created.'
+        )
+        string(
+            name: 'NODE_INSTANCE_TYPE',
+            defaultValue: 't3.medium',
+            description: 'EC2 instance type used only when a new cluster is created.'
+        )
+        string(
+            name: 'IMAGE_URI',
+            defaultValue: '',
+            description: 'Required immutable image URI, preferably an ECR URI with a digest.'
+        )
+        string(
+            name: 'APP_NAME',
+            defaultValue: 'my-application',
+            description: 'Kubernetes Deployment and Service name.'
+        )
+        string(
+            name: 'K8S_NAMESPACE',
+            defaultValue: 'production',
+            description: 'Kubernetes namespace into which the application is deployed.'
+        )
+        string(
+            name: 'APP_REPLICAS',
+            defaultValue: '3',
+            description: 'Number of application pods.'
+        )
+        string(
+            name: 'CONTAINER_PORT',
+            defaultValue: '8080',
+            description: 'Port on which the application listens inside the container.'
+        )
+        string(
+            name: 'SERVICE_PORT',
+            defaultValue: '80',
+            description: 'Port exposed by the Kubernetes Service.'
+        )
+        choice(
+            name: 'SERVICE_TYPE',
+            choices: ['LoadBalancer', 'ClusterIP'],
+            description: 'Use LoadBalancer for external access or ClusterIP for internal-only access.'
+        )
+    }
+
+    stages {
+        stage('Preflight') {
+            steps {
+                sh '''#!/usr/bin/env bash
+set -Eeuo pipefail
+export AWS_PAGER=""
+
+STATE_DIR="$WORKSPACE/.cd-state"
+KUBE_DIR="$WORKSPACE/.kube"
+rm -rf "$STATE_DIR" "$KUBE_DIR"
+mkdir -p "$STATE_DIR" "$KUBE_DIR"
+
+fail() {
+    echo "ERROR: $*" >&2
+    exit 2
+}
+
+is_dns_label() {
+    local value="$1"
+    [[ ${#value} -le 63 ]] && [[ "$value" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]
+}
+
+for command_name in aws eksctl kubectl; do
+    command -v "$command_name" >/dev/null 2>&1 || fail "Required command is missing: $command_name"
+done
+
+[[ -n "$AWS_REGION" ]] || fail "AWS_REGION is required."
+[[ "$EKS_CLUSTER_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || fail "Invalid EKS_CLUSTER_NAME."
+(( ${#EKS_CLUSTER_NAME} <= 100 )) || fail "EKS_CLUSTER_NAME must be 100 characters or fewer."
+
+[[ "$NODE_GROUP_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || fail "Invalid NODE_GROUP_NAME."
+(( ${#NODE_GROUP_NAME} <= 63 )) || fail "NODE_GROUP_NAME must be 63 characters or fewer."
+[[ "$NODE_INSTANCE_TYPE" =~ ^[A-Za-z0-9.-]+$ ]] || fail "Invalid NODE_INSTANCE_TYPE."
+
+if [[ -n "$KUBERNETES_VERSION" ]]; then
+    [[ "$KUBERNETES_VERSION" =~ ^[0-9]+\.[0-9]+$ ]] || fail "KUBERNETES_VERSION must look like 1.34."
+fi
+
+[[ -n "$IMAGE_URI" ]] || fail "IMAGE_URI is required. This CD pipeline does not build the image."
+[[ "$IMAGE_URI" =~ ^[A-Za-z0-9._/@:-]+$ ]] || fail "IMAGE_URI contains unsupported characters."
+
+is_dns_label "$APP_NAME" || fail "APP_NAME must be a valid lowercase Kubernetes DNS label."
+is_dns_label "$K8S_NAMESPACE" || fail "K8S_NAMESPACE must be a valid lowercase Kubernetes DNS label."
+
+[[ "$APP_REPLICAS" =~ ^[0-9]+$ ]] || fail "APP_REPLICAS must be an integer."
+(( APP_REPLICAS >= 1 )) || fail "APP_REPLICAS must be at least 1."
+
+[[ "$CONTAINER_PORT" =~ ^[0-9]+$ ]] || fail "CONTAINER_PORT must be an integer."
+(( CONTAINER_PORT >= 1 && CONTAINER_PORT <= 65535 )) || fail "CONTAINER_PORT is outside the valid range."
+
+[[ "$SERVICE_PORT" =~ ^[0-9]+$ ]] || fail "SERVICE_PORT must be an integer."
+(( SERVICE_PORT >= 1 && SERVICE_PORT <= 65535 )) || fail "SERVICE_PORT is outside the valid range."
+
+[[ "$SERVICE_TYPE" == "LoadBalancer" || "$SERVICE_TYPE" == "ClusterIP" ]] || fail "Unsupported SERVICE_TYPE."
+
+if [[ "$IMAGE_URI" == *":latest" ]]; then
+    echo "WARNING: IMAGE_URI uses the mutable latest tag. Prefer a release tag or image digest."
+fi
+
+echo "AWS identity:"
+aws sts get-caller-identity --query '{Account:Account,Arn:Arn}' --output table
+
+echo "Tool versions:"
+aws --version
+eksctl version
+kubectl version --client
+'''
+            }
+        }
+
+        stage('Discover EKS Cluster') {
+            steps {
+                sh '''#!/usr/bin/env bash
+set -Eeuo pipefail
+export AWS_PAGER=""
+STATE_DIR="$WORKSPACE/.cd-state"
+
+if aws eks describe-cluster \
+    --region "$AWS_REGION" \
+    --name "$EKS_CLUSTER_NAME" \
+    --output json >"$STATE_DIR/cluster.json" 2>"$STATE_DIR/cluster.err"; then
+
+    echo "existing" >"$STATE_DIR/cluster-origin"
+    CLUSTER_STATUS="$(aws eks describe-cluster \
+        --region "$AWS_REGION" \
+        --name "$EKS_CLUSTER_NAME" \
+        --query 'cluster.status' \
+        --output text)"
+
+    echo "Found existing cluster $EKS_CLUSTER_NAME with status $CLUSTER_STATUS."
+
+    case "$CLUSTER_STATUS" in
+        ACTIVE)
+            ;;
+        DELETING|FAILED)
+            echo "ERROR: Existing cluster is in status $CLUSTER_STATUS." >&2
+            exit 1
+            ;;
+        *)
+            echo "Waiting for the existing cluster to become ACTIVE."
+            aws eks wait cluster-active \
+                --region "$AWS_REGION" \
+                --name "$EKS_CLUSTER_NAME"
+            ;;
+    esac
+else
+    if grep -q 'ResourceNotFoundException' "$STATE_DIR/cluster.err"; then
+        echo "missing" >"$STATE_DIR/cluster-origin"
+        echo "Cluster $EKS_CLUSTER_NAME does not exist in $AWS_REGION."
+    else
+        echo "ERROR: Unable to determine whether the cluster exists." >&2
+        cat "$STATE_DIR/cluster.err" >&2
+        exit 1
+    fi
+fi
+'''
+            }
+        }
+
+        stage('Provision EKS When Missing') {
+            steps {
+                sh '''#!/usr/bin/env bash
+set -Eeuo pipefail
+export AWS_PAGER=""
+STATE_DIR="$WORKSPACE/.cd-state"
+
+if [[ "$(cat "$STATE_DIR/cluster-origin")" == "existing" ]]; then
+    echo "Reusing existing EKS cluster. No infrastructure changes will be made."
+    exit 0
+fi
+
+if [[ -n "$KUBERNETES_VERSION" ]]; then
+    VERSION_LINE="  version: \"$KUBERNETES_VERSION\""
+else
+    VERSION_LINE=""
+fi
+
+cat >"$STATE_DIR/eksctl-cluster.yaml" <<EOF_CLUSTER
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: "$EKS_CLUSTER_NAME"
+  region: "$AWS_REGION"
+$VERSION_LINE
+
+tags:
+  ManagedBy: "Jenkins"
+  Purpose: "application-cd"
+
+vpc:
+  nat:
+    gateway: Single
+
+iam:
+  withOIDC: true
+
+managedNodeGroups:
+  - name: "$NODE_GROUP_NAME"
+    instanceType: "$NODE_INSTANCE_TYPE"
+    desiredCapacity: 3
+    minSize: 3
+    maxSize: 3
+    privateNetworking: true
+    volumeSize: 30
+    labels:
+      workload: "application"
+    tags:
+      ManagedBy: "Jenkins"
+EOF_CLUSTER
+
+echo "Creating EKS cluster with exactly three managed worker nodes."
+eksctl create cluster --config-file "$STATE_DIR/eksctl-cluster.yaml"
+echo "created" >"$STATE_DIR/cluster-origin"
+'''
+            }
+        }
+
+        stage('Configure kubectl') {
+            steps {
+                sh '''#!/usr/bin/env bash
+set -Eeuo pipefail
+export AWS_PAGER=""
+export KUBECONFIG="$WORKSPACE/.kube/config"
+STATE_DIR="$WORKSPACE/.cd-state"
+
+aws eks update-kubeconfig \
+    --region "$AWS_REGION" \
+    --name "$EKS_CLUSTER_NAME" \
+    --alias "$EKS_CLUSTER_NAME" \
+    --kubeconfig "$KUBECONFIG"
+
+kubectl config current-context
+
+if kubectl get namespace "$K8S_NAMESPACE" >/dev/null 2>"$STATE_DIR/namespace.err"; then
+    echo "Namespace $K8S_NAMESPACE already exists."
+elif grep -qi 'NotFound' "$STATE_DIR/namespace.err"; then
+    echo "Creating namespace $K8S_NAMESPACE."
+    kubectl create namespace "$K8S_NAMESPACE"
+else
+    echo "ERROR: Jenkins can describe the EKS cluster, but kubectl cannot access it." >&2
+    echo "Check EKS access entries/RBAC and network reachability to the cluster endpoint." >&2
+    cat "$STATE_DIR/namespace.err" >&2
+    exit 1
+fi
+'''
+            }
+        }
+
+        stage('Validate New Cluster Nodes') {
+            steps {
+                sh '''#!/usr/bin/env bash
+set -Eeuo pipefail
+export KUBECONFIG="$WORKSPACE/.kube/config"
+STATE_DIR="$WORKSPACE/.cd-state"
+
+if [[ "$(cat "$STATE_DIR/cluster-origin")" != "created" ]]; then
+    echo "Existing cluster selected; its node count is intentionally not changed or enforced."
+    exit 0
+fi
+
+kubectl wait --for=condition=Ready node --all --timeout=10m
+
+READY_NODES="$(kubectl get nodes --no-headers | awk '$2 ~ /^Ready/ {count++} END {print count+0}')"
+if [[ "$READY_NODES" -ne 3 ]]; then
+    echo "ERROR: The new cluster should have exactly 3 Ready nodes, but has $READY_NODES." >&2
+    kubectl get nodes -o wide >&2
+    exit 1
+fi
+
+kubectl get nodes -o wide
+'''
+            }
+        }
+
+        stage('Deploy Application') {
+            steps {
+                sh '''#!/usr/bin/env bash
+set -Eeuo pipefail
+export KUBECONFIG="$WORKSPACE/.kube/config"
+STATE_DIR="$WORKSPACE/.cd-state"
+
+cat >"$STATE_DIR/application.yaml" <<EOF_APP
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: "$APP_NAME"
+  namespace: "$K8S_NAMESPACE"
+  labels:
+    app.kubernetes.io/name: "$APP_NAME"
+    app.kubernetes.io/managed-by: "jenkins"
+spec:
+  replicas: $APP_REPLICAS
+  revisionHistoryLimit: 5
+  minReadySeconds: 5
+  progressDeadlineSeconds: 600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: "$APP_NAME"
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: "$APP_NAME"
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        kubernetes.io/os: linux
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: "$APP_NAME"
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: "$APP_NAME"
+          image: "$IMAGE_URI"
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: $CONTAINER_PORT
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: "$APP_NAME"
+  namespace: "$K8S_NAMESPACE"
+  labels:
+    app.kubernetes.io/name: "$APP_NAME"
+    app.kubernetes.io/managed-by: "jenkins"
+spec:
+  type: $SERVICE_TYPE
+  selector:
+    app.kubernetes.io/name: "$APP_NAME"
+  ports:
+    - name: http
+      port: $SERVICE_PORT
+      targetPort: http
+      protocol: TCP
+EOF_APP
+
+kubectl apply -f "$STATE_DIR/application.yaml"
+kubectl annotate deployment "$APP_NAME" \
+    --namespace "$K8S_NAMESPACE" \
+    kubernetes.io/change-cause="Jenkins $JOB_NAME build $BUILD_NUMBER deployed $IMAGE_URI" \
+    --overwrite
+'''
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                sh '''#!/usr/bin/env bash
+set -Eeuo pipefail
+export KUBECONFIG="$WORKSPACE/.kube/config"
+STATE_DIR="$WORKSPACE/.cd-state"
+
+kubectl rollout status deployment/"$APP_NAME" \
+    --namespace "$K8S_NAMESPACE" \
+    --timeout=10m
+
+kubectl get deployment,pods,service \
+    --namespace "$K8S_NAMESPACE" \
+    --selector "app.kubernetes.io/name=$APP_NAME" \
+    --output wide
+
+if [[ "$SERVICE_TYPE" == "LoadBalancer" ]]; then
+    LOAD_BALANCER_ADDRESS=""
+
+    for attempt in $(seq 1 60); do
+        LOAD_BALANCER_HOSTNAME="$(kubectl get service "$APP_NAME" \
+            --namespace "$K8S_NAMESPACE" \
+            --output jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
+        LOAD_BALANCER_IP="$(kubectl get service "$APP_NAME" \
+            --namespace "$K8S_NAMESPACE" \
+            --output jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+
+        if [[ -n "$LOAD_BALANCER_HOSTNAME" ]]; then
+            LOAD_BALANCER_ADDRESS="$LOAD_BALANCER_HOSTNAME"
+            break
+        fi
+
+        if [[ -n "$LOAD_BALANCER_IP" ]]; then
+            LOAD_BALANCER_ADDRESS="$LOAD_BALANCER_IP"
+            break
+        fi
+
+        sleep 10
+    done
+
+    if [[ -z "$LOAD_BALANCER_ADDRESS" ]]; then
+        echo "ERROR: The application rolled out, but the LoadBalancer Service did not receive an address." >&2
+        kubectl describe service "$APP_NAME" --namespace "$K8S_NAMESPACE" >&2
+        exit 1
+    fi
+
+    echo "$LOAD_BALANCER_ADDRESS" >"$STATE_DIR/endpoint.txt"
+    echo "Load balancer address: $LOAD_BALANCER_ADDRESS"
+    echo "Service port: $SERVICE_PORT"
+else
+    CLUSTER_IP="$(kubectl get service "$APP_NAME" \
+        --namespace "$K8S_NAMESPACE" \
+        --output jsonpath='{.spec.clusterIP}')"
+    echo "Cluster-internal service address: $CLUSTER_IP:$SERVICE_PORT"
+fi
+'''
+            }
+        }
+    }
+
+    post {
+        failure {
+            sh '''#!/usr/bin/env bash
+set +e
+export KUBECONFIG="$WORKSPACE/.kube/config"
+
+if [[ -s "$KUBECONFIG" ]]; then
+    echo "===== Deployment diagnostics ====="
+    kubectl get deployment,pods,service \
+        --namespace "$K8S_NAMESPACE" \
+        --selector "app.kubernetes.io/name=$APP_NAME" \
+        --output wide
+
+    kubectl describe deployment "$APP_NAME" --namespace "$K8S_NAMESPACE"
+
+    echo "===== Recent namespace events ====="
+    kubectl get events \
+        --namespace "$K8S_NAMESPACE" \
+        --sort-by='.metadata.creationTimestamp' | tail -n 50
+fi
+'''
+        }
+
+        cleanup {
+            sh '''#!/usr/bin/env bash
+rm -rf "$WORKSPACE/.kube" "$WORKSPACE/.cd-state"
+'''
+        }
+    }
+}
